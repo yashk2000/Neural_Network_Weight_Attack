@@ -1,3 +1,4 @@
+
 #!/usr/bin/env sh
 
 ############### Host   ##############################
@@ -7,8 +8,8 @@ echo "Current host is: $HOST"
 # Automatic check the host and configure
 case $HOST in
 "alpha")
-    PYTHON="/home/elliot/anaconda3/envs/bindsnet/bin/python" # python environment path
-    TENSORBOARD='/home/elliot/anaconda3/envs/bindsnet/bin/tensorboard' # tensorboard environment path
+    PYTHON="/home/elliot/anaconda3/envs/pytorch041/bin/python" # python environment path
+    TENSORBOARD='/home/elliot/anaconda3/envs/pytorch041/bin/tensorboard' # tensorboard environment path
     data_path='/home/elliot/data/imagenet' # dataset path
     ;;
 esac
@@ -16,38 +17,41 @@ esac
 DATE=`date +%Y-%m-%d`
 
 if [ ! -d "$DIRECTORY" ]; then
-    mkdir ./save/${DATE}/
+    mkdir /"content"/${DATE}/
 fi
 
 ############### Configurations ########################
 enable_tb_display=false # enable tensorboard display
-model=resnet34_quan 
+model=resnet34_quan
 dataset=imagenet
 test_batch_size=256
 
-attack_sample_size=128 # number of data used for BFA
-n_iter=20 # number of iteration to perform BFA
+attack_sample_size=64 # number of image samples used for BFA
+n_iter=50 # maximum allowed PBS iterations
 k_top=10 # only check k_top weights with top gradient ranking in each layer
 
-save_path=/home/elliot/Documents/ICCV_2019_BFA/save/${DATE}/${dataset}_${model}
-tb_path=./save/${DATE}/${dataset}_${model}_${epochs}_${optimizer}_${quantize}/tb_log  #tensorboard log path
+save_path=/"content"/${DATE}/${dataset}_${model}_BFA
+tb_path=${save_path}/tb_log  #tensorboard log path
 
 ############### Neural network ############################
 {
-$PYTHON main.py --dataset ${dataset} \
-    --data_path ${data_path}   \
+python main.py --dataset ${dataset} \
+    --data_path "/content/imagenet_1k"   \
     --arch ${model} --save_path ${save_path}  \
-    --test_batch_size ${test_batch_size} --workers 8 --ngpu 2 \
+    --test_batch_size ${test_batch_size} --workers 8 --ngpu 1 --gpu_id 0 \
     --print_freq 50 \
-    --reset_weight --bfa --n_iter ${n_iter} --k_top ${k_top} \
-    --attack_sample_size ${attack_sample_size}
+    --bfa \
+    --reset_weight \
+    --n_iter ${n_iter} --k_top ${k_top} \
+    --attack_sample_size ${attack_sample_size} \
+    # --random_bfa
 } &
 ############## Tensorboard logging ##########################
 {
 if [ "$enable_tb_display" = true ]; then 
     sleep 30 
     wait
-    $TENSORBOARD --logdir $tb_path  --port=6006
+    tensorboard --logdir $tb_path  --port=6006
 fi
 } &
 {
