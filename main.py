@@ -1,3 +1,4 @@
+
 from __future__ import division
 from __future__ import absolute_import
 
@@ -15,6 +16,9 @@ from models.quantization import quan_Conv2d, quan_Linear, quantize
 from attack.BFA import *
 import torch.nn.functional as F
 import copy
+
+import pandas as pd
+import numpy as np
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -124,16 +128,16 @@ parser.add_argument('--workers',
 parser.add_argument('--manualSeed', type=int, default=None, help='manual seed')
 # quantization
 parser.add_argument(
+    '--quan_bitwidth',
+    type=int,
+    default=None,
+    help='the bitwidth used for quantization')
+parser.add_argument(
     '--reset_weight',
     dest='reset_weight',
     action='store_true',
     help='enable the weight replacement with the quantized weight')
-parser.add_argument(
-    '--optimize_step',
-    dest='optimize_step',
-    action='store_true',
-    help='enable the step size optimization for weight quantization')
-# Bit Flip Attacked
+# Bit Flip Attack
 parser.add_argument('--bfa',
                     dest='enable_bfa',
                     action='store_true',
@@ -149,9 +153,23 @@ parser.add_argument('--n_iter',
 parser.add_argument(
     '--k_top',
     type=int,
-    default=10,
+    default=None,
     help='k weight with top ranking gradient used for bit-level gradient check.'
 )
+parser.add_argument('--random_bfa',
+                    dest='random_bfa',
+                    action='store_true',
+                    help='perform the bit-flips randomly on weight bits')
+
+# Piecewise clustering
+parser.add_argument('--clustering',
+                    dest='clustering',
+                    action='store_true',
+                    help='add the piecewise clustering term.')
+parser.add_argument('--lambda_coeff',
+                    type=float,
+                    default=1e-3,
+                    help='lambda coefficient to control the clustering term')
 
 ##########################################################################
 
@@ -339,7 +357,7 @@ def main():
     ]
 
     step_param = [
-        param for name, param in net.named_parameters() if 'step_size' in name
+        param for name, param in net.named_parameters() if 'step_size' in name 
     ]
 
     if args.optimizer == "SGD":
@@ -353,7 +371,7 @@ def main():
     elif args.optimizer == "Adam":
         print("using Adam as optimizer")
         optimizer = torch.optim.Adam(filter(lambda param: param.requires_grad,
-                                            net.parameters()),
+                                            all_param),
                                      lr=state['learning_rate'],
                                      weight_decay=state['decay'])
 
@@ -400,40 +418,16 @@ def main():
     else:
         print_log(
             "=> do not use any checkpoint for {} model".format(args.arch), log)
+        
+    # Configure the quantization bit-width
+    if args.quan_bitwidth is not None:
+        change_quan_bitwidth(net, args.quan_bitwidth)
 
     # update the step_size once the model is loaded. This is used for quantization.
     for m in net.modules():
         if isinstance(m, quan_Conv2d) or isinstance(m, quan_Linear):
             # simple step size update based on the pretrained model or weight init
             m.__reset_stepsize__()
-
-    # block for quantizer optimization
-    if args.optimize_step:
-        optimizer_quan = torch.optim.SGD(step_param,
-                                         lr=0.01,
-                                         momentum=0.9,
-                                         weight_decay=0,
-                                         nesterov=True)
-
-        for m in net.modules():
-            if isinstance(m, quan_Conv2d) or isinstance(m, quan_Linear):
-                for i in range(
-                        300
-                ):  # runs 200 iterations to reduce quantization error
-                    optimizer_quan.zero_grad()
-                    weight_quan = quantize(m.weight, m.step_size,
-                                           m.half_lvls) * m.step_size
-                    loss_quan = F.mse_loss(weight_quan,
-                                           m.weight,
-                                           reduction='mean')
-                    loss_quan.backward()
-                    optimizer_quan.step()
-
-        for m in net.modules():
-            if isinstance(m, quan_Conv2d):
-                print(m.step_size.data.item(),
-                      (m.step_size.detach() * m.half_lvls).item(),
-                      m.weight.max().item())
 
     # block for weight reset
     if args.reset_weight:
@@ -442,17 +436,20 @@ def main():
                 m.__reset_weight__()
                 # print(m.weight)
 
-    attacker = BFA(criterion, args.k_top)
+    attacker = BFA(criterion, net, args.k_top)
     net_clean = copy.deepcopy(net)
     # weight_conversion(net)
 
     if args.enable_bfa:
         perform_attack(attacker, net, net_clean, train_loader, test_loader,
-                       args.n_iter, log, writer)
+                       args.n_iter, log, writer, csv_save_path=args.save_path,
+                       random_attack=args.random_bfa)
         return
 
     if args.evaluate:
-        validate(test_loader, net, criterion, log)
+        _,_,_, output_summary = validate(test_loader, net, criterion, log, summary_output=True)
+        pd.DataFrame(output_summary).to_csv(os.path.join(args.save_path, 'output_summary_{}.csv'.format(args.arch)),
+                                            header=['top-1 output'], index=False)
         return
 
     # Main loop
@@ -514,23 +511,35 @@ def main():
         ## Log the graidents distribution
         for name, param in net.named_parameters():
             name = name.replace('.', '/')
-            writer.add_histogram(name + '/grad',
-                                 param.grad.clone().cpu().data.numpy(),
-                                 epoch + 1,
-                                 bins='tensorflow')
-
-        # ## Log the weight and bias distribution
+            try:
+                writer.add_histogram(name + '/grad',
+                                    param.grad.clone().cpu().data.numpy(),
+                                    epoch + 1,
+                                    bins='tensorflow')
+            except:
+                pass
+            
+            try:
+                writer.add_histogram(name, param.clone().cpu().data.numpy(),
+                                      epoch + 1, bins='tensorflow')
+            except:
+                pass
+            
+        total_weight_change = 0 
+            
         for name, module in net.named_modules():
-            name = name.replace('.', '/')
-            class_name = str(module.__class__).split('.')[-1].split("'")[0]
-
-            if "Conv2d" in class_name or "Linear" in class_name:
-                if module.weight is not None:
-                    writer.add_histogram(
-                        name + '/weight/',
-                        module.weight.clone().cpu().data.numpy(),
-                        epoch + 1,
-                        bins='tensorflow')
+            if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
+                try:
+                    writer.add_histogram(name+'/bin_weight', module.bin_weight.clone().cpu().data.numpy(), epoch + 1,
+                                        bins='tensorflow')
+                    writer.add_scalar(name + '/bin_weight_change', module.bin_weight_change, epoch+1)
+                    total_weight_change += module.bin_weight_change
+                    writer.add_scalar(name + '/bin_weight_change_ratio', module.bin_weight_change_ratio, epoch+1)
+                except:
+                    pass
+                
+        writer.add_scalar('total_weight_change', total_weight_change, epoch + 1)
+        print('total weight changes:', total_weight_change)
 
         writer.add_scalar('loss/train_loss', train_los, epoch + 1)
         writer.add_scalar('loss/test_loss', val_los, epoch + 1)
@@ -542,7 +551,7 @@ def main():
 
 
 def perform_attack(attacker, model, model_clean, train_loader, test_loader,
-                   N_iter, log, writer):
+                   N_iter, log, writer, csv_save_path=None, random_attack=False):
     # Note that, attack has to be done in evaluation model due to batch-norm.
     # see: https://discuss.pytorch.org/t/what-does-model-eval-do-for-batchnorm-layer/7146
     model.eval()
@@ -553,15 +562,19 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
     # attempt to use the training data to conduct BFA
     for _, (data, target) in enumerate(train_loader):
         if args.use_cuda:
-            target = target.cuda(async=True)
+            target = target.cuda(non_blocking=True)
             data = data.cuda()
         # Override the target to prevent label leaking
         _, target = model(data).data.max(1)
         break
 
     # evaluate the test accuracy of clean model
-    val_acc_top1, val_acc_top5, val_loss = validate(test_loader, model,
-                                                    attacker.criterion, log)
+    val_acc_top1, val_acc_top5, val_loss, output_summary = validate(test_loader, model,
+                                                    attacker.criterion, log, summary_output=True)
+    tmp_df = pd.DataFrame(output_summary, columns=['top-1 output'])
+    tmp_df['BFA iteration'] = 0
+    tmp_df.to_csv(os.path.join(args.save_path, 'output_summary_{}_BFA_0.csv'.format(args.arch)),
+                                        index=False)
 
     writer.add_scalar('attack/val_top1_acc', val_acc_top1, 0)
     writer.add_scalar('attack/val_top5_acc', val_acc_top5, 0)
@@ -570,10 +583,18 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
     print_log('k_top is set to {}'.format(args.k_top), log)
     print_log('Attack sample size is {}'.format(data.size()[0]), log)
     end = time.time()
+    
+    df = pd.DataFrame() #init a empty dataframe for logging
+    last_val_acc_top1 = val_acc_top1
+    
     for i_iter in range(N_iter):
         print_log('**********************************', log)
-        attacker.progressive_bit_search(model, data, target)
-
+        if not random_attack:
+            attack_log = attacker.progressive_bit_search(model, data, target)
+        else:
+            attack_log = attacker.random_flip_one_bit(model)
+            
+        
         # measure data loading time
         attack_time.update(time.time() - end)
         end = time.time()
@@ -581,7 +602,8 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
         h_dist = hamming_distance(model, model_clean)
 
         # record the loss
-        losses.update(attacker.loss_max, data.size(0))
+        if hasattr(attacker, "loss_max"):
+            losses.update(attacker.loss_max, data.size(0))
 
         print_log(
             'Iteration: [{:03d}/{:03d}]   '
@@ -590,10 +612,13 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
                    N_iter,
                    attack_time=attack_time,
                    iter_time=iter_time) + time_string(), log)
-
-        print_log('loss before attack: {:.4f}'.format(attacker.loss.item()),
-                  log)
-        print_log('loss after attack: {:.4f}'.format(attacker.loss_max), log)
+        try:
+            print_log('loss before attack: {:.4f}'.format(attacker.loss.item()),
+                    log)
+            print_log('loss after attack: {:.4f}'.format(attacker.loss_max), log)
+        except:
+            pass
+        
         print_log('bit flips: {:.0f}'.format(attacker.bit_counter), log)
         print_log('hamming_dist: {:.0f}'.format(h_dist), log)
 
@@ -602,8 +627,24 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
         writer.add_scalar('attack/sample_loss', losses.avg, i_iter + 1)
 
         # exam the BFA on entire val dataset
-        val_acc_top1, val_acc_top5, val_loss = validate(
-            test_loader, model, attacker.criterion, log)
+        val_acc_top1, val_acc_top5, val_loss, output_summary = validate(
+            test_loader, model, attacker.criterion, log, summary_output=True)
+        tmp_df = pd.DataFrame(output_summary, columns=['top-1 output'])
+        tmp_df['BFA iteration'] = i_iter + 1
+        tmp_df.to_csv(os.path.join(args.save_path, 'output_summary_{}_BFA_{}.csv'.format(args.arch, i_iter + 1)),
+                                    index=False)
+    
+        
+        # add additional info for logging
+        acc_drop = last_val_acc_top1 - val_acc_top1
+        last_val_acc_top1 = val_acc_top1
+        
+        # print(attack_log)
+        for i in range(attack_log.__len__()):
+            attack_log[i].append(val_acc_top1)
+            attack_log[i].append(acc_drop)
+        # print(attack_log)
+        df = df.append(attack_log, ignore_index=True)
 
         writer.add_scalar('attack/val_top1_acc', val_acc_top1, i_iter + 1)
         writer.add_scalar('attack/val_top5_acc', val_acc_top5, i_iter + 1)
@@ -615,6 +656,24 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
             'iteration Time {iter_time.val:.3f} ({iter_time.avg:.3f})'.format(
                 iter_time=iter_time), log)
         end = time.time()
+        
+        # Stop the attack if the accuracy is below the configured break_acc.
+        if args.dataset == 'cifar10':
+            break_acc = 11.0
+        elif args.dataset == 'imagenet':
+            break_acc = 0.2
+        if val_acc_top1 <= break_acc:
+            break
+        
+    # attack profile
+    column_list = ['module idx', 'bit-flip idx', 'module name', 'weight idx',
+                  'weight before attack', 'weight after attack', 'validation accuracy',
+                  'accuracy drop']
+    df.columns = column_list
+    df['trial seed'] = args.manualSeed
+    if csv_save_path is not None:
+        csv_file_name = 'attack_profile_{}.csv'.format(args.manualSeed)
+        export_csv = df.to_csv(os.path.join(csv_save_path, csv_file_name), index=None)
 
     return
 
@@ -637,13 +696,15 @@ def train(train_loader, model, criterion, optimizer, epoch, log):
 
         if args.use_cuda:
             target = target.cuda(
-                async=True
+                non_blocking=True
             )  # the copy will be asynchronous with respect to the host.
             input = input.cuda()
 
         # compute output
         output = model(input)
         loss = criterion(output, target)
+        if args.clustering:
+            loss += clustering_loss(model, args.lambda_coeff)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
@@ -682,23 +743,29 @@ def train(train_loader, model, criterion, optimizer, epoch, log):
     return top1.avg, losses.avg
 
 
-def validate(val_loader, model, criterion, log):
+def validate(val_loader, model, criterion, log, summary_output=False):
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
     # switch to evaluate mode
     model.eval()
+    output_summary = [] # init a list for output summary
 
     with torch.no_grad():
         for i, (input, target) in enumerate(val_loader):
             if args.use_cuda:
-                target = target.cuda(async=True)
+                target = target.cuda(non_blocking=True)
                 input = input.cuda()
 
             # compute output
             output = model(input)
             loss = criterion(output, target)
+            
+            # summary the output
+            if summary_output:
+                tmp_list = output.max(1, keepdim=True)[1].flatten().cpu().numpy() # get the index of the max log-probability
+                output_summary.append(tmp_list)
 
             # measure accuracy and record loss
             prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
@@ -709,8 +776,12 @@ def validate(val_loader, model, criterion, log):
         print_log(
             '  **Test** Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Error@1 {error1:.3f}'
             .format(top1=top1, top5=top5, error1=100 - top1.avg), log)
-
-    return top1.avg, top5.avg, losses.avg
+        
+    if summary_output:
+        output_summary = np.asarray(output_summary).flatten()
+        return top1.avg, top5.avg, losses.avg, output_summary
+    else:
+        return top1.avg, top5.avg, losses.avg
 
 
 def print_log(print_string, log):
@@ -760,10 +831,9 @@ def accuracy(output, target, topk=(1, )):
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
         correct = pred.eq(target.view(1, -1).expand_as(pred))
-
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0)
+            correct_k = correct[:k].reshape(-1).float().sum(0)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
@@ -789,3 +859,4 @@ def accuracy_logger(base_dir, epoch, train_accuracy, test_accuracy):
 
 if __name__ == '__main__':
     main()
+    
