@@ -1,3 +1,4 @@
+import random
 import torch
 from models.quantization import quan_Conv2d, quan_Linear, quantize
 import operator
@@ -5,7 +6,7 @@ from attack.data_conversion import *
 
 
 class BFA(object):
-    def __init__(self, criterion, k_top=10):
+    def __init__(self, criterion, model, k_top=10):
 
         self.criterion = criterion
         # init a loss_dict to log the loss w.r.t each layer
@@ -14,15 +15,24 @@ class BFA(object):
         self.k_top = k_top
         self.n_bits2flip = 0
         self.loss = 0
+        
+        # attributes for random attack
+        self.module_list = []
+        for name, m in model.named_modules():
+            if isinstance(m, quan_Conv2d) or isinstance(m, quan_Linear):
+                self.module_list.append(name)       
 
     def flip_bit(self, m):
         '''
         the data type of input param is 32-bit floating, then return the data should
         be in the same data_type.
         '''
+        if self.k_top is None:
+            k_top = m.weight.detach().flatten().__len__()
+        else: 
+            k_top = self.k_top
         # 1. flatten the gradient tensor to perform topk
-        w_grad_topk, w_idx_topk = m.weight.grad.detach().abs().view(-1).topk(
-            self.k_top)
+        w_grad_topk, w_idx_topk = m.weight.grad.detach().abs().view(-1).topk(k_top)
         # update the b_grad to its signed representation
         w_grad_topk = m.weight.grad.detach().view(-1)[w_idx_topk]
 
@@ -37,8 +47,8 @@ class BFA(object):
         w_bin = int2bin(m.weight.detach().view(-1), m.N_bits).short()
         w_bin_topk = w_bin[w_idx_topk]  # get the weights whose grads are topk
         # generate two's complement bit-map
-        b_bin_topk = (w_bin_topk.repeat(m.N_bits,1) & m.b_w.abs().repeat(1,self.k_top).short()) \
-        // m.b_w.abs().repeat(1,self.k_top).short()
+        b_bin_topk = (w_bin_topk.repeat(m.N_bits,1) & m.b_w.abs().repeat(1,k_top).short()) \
+        // m.b_w.abs().repeat(1,k_top).short()
         grad_mask = b_bin_topk ^ b_grad_topk_sign.short()
 
         # 4. apply the gradient mask upon ```b_grad_topk``` and in-place update it
@@ -56,11 +66,8 @@ class BFA(object):
         else:
             pass
 
-
-#         print(bit2flip)
-
-# 6. Based on the identified bit indexed by ```bit2flip```, generate another
-# mask, then perform the bitwise xor operation to realize the bit-flip.
+        # 6. Based on the identified bit indexed by ```bit2flip```, generate another
+        # mask, then perform the bitwise xor operation to realize the bit-flip.
         w_bin_topk_flipped = (bit2flip.short() * m.b_w.abs().short()).sum(0, dtype=torch.int16) \
                 ^ w_bin_topk
 
@@ -118,15 +125,42 @@ class BFA(object):
             self.loss_max = self.loss_dict[max_loss_module]
 
         # 4. if the loss_max does lead to the degradation compared to the self.loss,
-        # then change the that layer's weight without putting back the clean weight
-        for name, module in model.named_modules():
+        # then change that layer's weight without putting back the clean weight
+        for module_idx, (name, module) in enumerate(model.named_modules()):
             if name == max_loss_module:
-                #                 print(name, self.loss.item(), loss_max)
+                # print(name, self.loss.item(), loss_max)
                 attack_weight = self.flip_bit(module)
+                
+                weight_mismatch = attack_weight - module.weight.detach()
+                attack_weight_idx = torch.nonzero(weight_mismatch)
+                
+                print('attacked module:', max_loss_module)
+                
+                attack_log = [] # init an empty list for profile
+                
+                for i in range(attack_weight_idx.size()[0]):
+                    
+                    weight_idx = attack_weight_idx[i,:].cpu().numpy()
+                    weight_prior = module.weight.detach()[tuple(attack_weight_idx[i,:])].item()
+                    weight_post = attack_weight[tuple(attack_weight_idx[i,:])].item()
+                    
+                    print('attacked weight index:', weight_idx)
+                    print('weight before attack:', weight_prior)
+                    print('weight after attack:', weight_post)
+                    
+                    tmp_list = [module_idx, # module index in the net
+                                self.bit_counter + (i+1), # current bit-flip index
+                                max_loss_module, # current bit-flip module
+                                weight_idx, # attacked weight index in weight tensor
+                                weight_prior, # weight magnitude before attack
+                                weight_post # weight magnitude after attack
+                                ] 
+                    attack_log.append(tmp_list)                
+                
                 module.weight.data = attack_weight
 
         # reset the bits2flip back to 0
         self.bit_counter += self.n_bits2flip
         self.n_bits2flip = 0
 
-        return
+        return attack_log
