@@ -135,6 +135,8 @@ class BFA(object):
                 attack_weight_idx = torch.nonzero(weight_mismatch)
                 
                 print('attacked module:', max_loss_module)
+                print('attacked module shape:', module.weight.shape)
+                print('attack weight shape:', attack_weight.shape)
                 
                 attack_log = [] # init an empty list for profile
                 
